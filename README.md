@@ -47,7 +47,7 @@ Use this script to ingest raw source code, strip unnecessary token bloat, and pr
 
 ---
 
-## How to Use `split_dataset.py`
+## How to Use `splitting_codebase_content.py`
 
 Use this script to break down large dataset files into smaller, byte-bounded chunks for API upload limits or vector database batching.
 
