@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ==============================================================================
 # AUTHOR:          Peter A. Aldrich Jr. (PJ)
-# PROJECT:         ARCHON AI Platform Engineering
-# MODULE:          split_dataset.py
+# PROJECT:         AI Platform Engineering
+# MODULE:          splitting_codebase_content.py
 # DESCRIPTION:     Multi-Format Dataset Splitter for .icb (Ingested Codebase)
 #                  and standard RAG dataset files (.jsonl, .json, .csv, .md).
 #                  Partition oversized files into target byte-size chunks without
@@ -13,8 +13,8 @@
 # ==============================================================================
 
 """
-ARCHON Dataset Splitter Tool (.icb & Multi-Format Edition)
-===========================================================
+Dataset Splitter Tool (.icb & Multi-Format Edition)
+====================================================
 
 This module provides a production-grade utility for splitting oversized codebase 
 ingestion datasets into clean, byte-bounded chunk files suitable for direct LLM 
