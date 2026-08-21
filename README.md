@@ -1,4 +1,4 @@
-#  Codebase Ingestion & Dataset Preparation Tools
+#  Codebase Ingestion & Dataset Preparation Toolchain
 
 This toolkit consists of two Python scripts designed to ingest source code repositories, clean text payloads for optimized LLM token consumption, and split oversized dataset files into byte-bounded chunks for RAG vector databases and API batch uploads.
 
