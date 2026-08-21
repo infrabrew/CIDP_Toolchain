@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ==============================================================================
 # AUTHOR:          Peter A. Aldrich Jr. (PJ)
-# PROJECT:         ARCHON AI Platform Engineering
-# MODULE:          codebase_pipeline.py
+# PROJECT:         AI Platform Engineering
+# MODULE:          ingest_codebase_exporter.py
 # DESCRIPTION:     Production Codebase Ingestion & Vector Document Loader Engine
 #                  with Real-Time Terminal Progress Feedback & Streaming UI.
 # VERSION:         2.2.0
@@ -12,8 +12,8 @@
 # ==============================================================================
 
 """
-ARCHON Codebase Ingestion & Vector Document Loader Engine
-=========================================================
+odebase Ingestion & Vector Document Loader Engine
+==================================================
 
 This module provides an end-to-end high-performance pipeline that ingests source 
 code, plain text files, configuration files, and documentation trees into clean, 
