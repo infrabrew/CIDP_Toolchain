@@ -5,9 +5,9 @@
 # MODULE:          codebase_pipeline.py
 # DESCRIPTION:     Unified Codebase & Document Ingestion Engine with Integrated 
 #                  PDF/DOCX Document Parsing, Web Crawling, and Auto-Chunk Splitting.
-# VERSION:         3.0.0
+# VERSION:         3.1.0
 # PYTHON_VERSION:  3.8+
-# DEPENDENCIES:    Standard Library Only (zipfile, xml, urllib, html.parser, re, gzip, argparse)
+# DEPENDENCIES:    Standard Library Only (json, zipfile, xml, urllib, html.parser, re, gzip, argparse)
 # ==============================================================================
 
 """
@@ -26,38 +26,29 @@ Key Architectural Capabilities:
    automatically converts them to clean Markdown using zero-dependency parsers. Fetches 
    HTTP/HTTPS URLs and converts DOM nodes into clean structured text.
 
-2. Automated Output Dataset Splitting:
+2. Non-Blocking Fault Tolerations:
+   Guards every file parser, web fetcher, and subprocess call with fine-grained error handlers 
+   so malformed PDF streams, corrupted zip archives, or network timeouts skip cleanly 
+   without breaking batch pipeline execution.
+
+3. Default Source Fallback:
+   If execution is invoked without specifying input sources, defaults seamlessly to 
+   ingesting the current directory (`.`).
+
+4. Automated Output Dataset Splitting:
    Optional `--split-mb` flag triggers automatic byte-bounded dataset partitioning at the 
    end of ingestion without invoking external CLI tools.
 
-3. Lossless Text Minification:
+5. Lossless Text Minification:
    Optimizes text payloads prior to vector embedding. Trailing whitespace is stripped and 
    duplicate blank lines are collapsed, shrinking LLM token context sizes by 15-30% without 
    destroying code execution logic or comments.
-
-4. Transparent Output Streaming:
-   Uses polymorphic stream handlers (`gzip.open` vs `open`) to process gigabyte-scale 
-   codebases with zero-buffering memory overhead directly into Gzip archives.
-
-5. LangChain RAG Parity:
-   Parses ingested datasets directly back into memory as standard LangChain `Document` 
-   objects ready for vector store chunking and embedding.
-
-CLI Execution Examples:
------------------------
-1. Ingest local directories, Git repositories, and web URLs into a Gzip dataset with 10 MiB auto-splitting:
-   $ python codebase_pipeline.py /path/to/project https://github.com/vllm-project/vllm.git https://docs.python.org/3/ -o codebase.jsonl.gz -c --split-mb 10
-
-2. Ingest without minification or compression:
-   $ python codebase_pipeline.py /path/to/project -o codebase.jsonl --no-minify
-
-3. Load an existing dataset directly into memory for RAG testing:
-   $ python codebase_pipeline.py -o codebase.jsonl.gz --load-only
 """
 
 import os
 import re
 import sys
+import json
 import gzip
 import time
 import shutil
@@ -67,6 +58,7 @@ import subprocess
 import argparse
 import urllib.request
 import urllib.parse
+import urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from html.parser import HTMLParser
@@ -77,9 +69,6 @@ from typing import List, Dict, Any, Generator, Optional, Tuple
 # DEPENDENCY RESOLUTION & FALLBACK STUBS
 # ==============================================================================
 
-# Attempt to import native LangChain Document abstractions. If `langchain-core` 
-# is missing in the local environment, instantiate a compatible fallback stub 
-# to prevent import errors during standalone execution.
 try:
     from langchain_core.documents import Document
     LANGCHAIN_AVAILABLE = True
@@ -96,8 +85,7 @@ except ImportError:
             self.metadata = metadata
 
         def __repr__(self) -> str:
-            preview = self.page_content[:30].replace("
-", " ")
+            preview = self.page_content[:30].replace("\n", " ")
             return f"Document(page_content='{preview}...', metadata={self.metadata})"
 
 
@@ -105,13 +93,11 @@ except ImportError:
 # GLOBAL EXCLUSION FILTERS & PATTERNS
 # ==============================================================================
 
-# Directories to ignore during recursive filesystem traversal
 DEFAULT_IGNORE_DIRS = {
     ".git", ".svn", "__pycache__", "node_modules", "venv", ".venv",
     "env", ".env", "dist", "build", ".idea", ".vscode", ".pytest_cache"
 }
 
-# Binary, compiled, or media file extensions to exclude from plain-text ingestion
 DEFAULT_IGNORE_EXTS = {
     ".pyc", ".pyo", ".pyd", ".png", ".jpg", ".jpeg", ".gif", ".ico",
     ".svg", ".zip", ".tar", ".gz", ".7z", ".exe", ".dll",
@@ -154,19 +140,13 @@ class NativeHTMLToMarkdownParser(HTMLParser):
         if self.export_format == "md":
             if tag in ["h1", "h2", "h3", "h4", "h5", "h6"]:
                 level = int(tag[1])
-                self.result.append(f"
-
-{'#' * level} ")
+                self.result.append(f"\n\n{'#' * level} ")
             elif tag in ["p", "div", "section", "article"]:
-                self.result.append("
-
-")
+                self.result.append("\n\n")
             elif tag == "li":
-                self.result.append("
-- ")
+                self.result.append("\n- ")
             elif tag == "tr":
-                self.result.append("
-")
+                self.result.append("\n")
             elif tag == "td" or tag == "th":
                 self.result.append(" | ")
             elif tag == "a" and "href" in attr_dict:
@@ -176,8 +156,7 @@ class NativeHTMLToMarkdownParser(HTMLParser):
                 self.result.append(" `")
         else:
             if tag in ["h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "li", "tr"]:
-                self.result.append("
-")
+                self.result.append("\n")
 
     def handle_endtag(self, tag: str):
         tag = tag.lower()
@@ -213,32 +192,22 @@ class NativeHTMLToMarkdownParser(HTMLParser):
 
 
 # ==============================================================================
-# TEXT SANITIZATION & NATIVE DOCUMENT PARSERS
+# TEXT SANITIZATION & FAULT-TOLERANT PARSERS
 # ==============================================================================
 
 def clean_extracted_text(text: str) -> str:
     """
     Applies layout cleaning, character sanitization, and whitespace 
     normalization to raw extracted document text.
-
-    Args:
-        text (str): Raw extracted string content.
-
-    Returns:
-        str: Cleaned, structured text ready for RAG ingestion.
     """
     if not text:
         return ""
 
-    # Replace null bytes and non-printable control characters
-    text = re.sub(r'[ --]', '', text)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    text = text.replace('\u201c', '"').replace('\u201d', '"')
+    text = text.replace('\u2018', "'").replace('\u2019', "'")
+    text = text.replace('\u2013', '-').replace('\u2014', '--')
 
-    # Normalize Unicode quotes, apostrophes, and dashes
-    text = text.replace('“', '"').replace('”', '"')
-    text = text.replace('‘', "'").replace('’', "'")
-    text = text.replace('–', '-').replace('—', '--')
-
-    # Remove generic PDF page number artifacts
     text = re.sub(r'(?i)^\s*(page\s+\d+(\s+of\s+\d+)?|\d+\s*\|\s*page)\s*$', '', text, flags=re.MULTILINE)
 
     lines = text.splitlines()
@@ -256,23 +225,16 @@ def clean_extracted_text(text: str) -> str:
             continue
 
         prev_empty = False
-        stripped = re.sub(r'^\s*[•‣◦⁃∙]\s*', '- ', stripped)
+        stripped = re.sub(r'^\s*[\u2022\u2023\u25e6\u2043\u2219]\s*', '- ', stripped)
         cleaned_lines.append(stripped)
 
-    return "
-".join(cleaned_lines).strip()
+    return "\n".join(cleaned_lines).strip()
 
 
 def parse_docx_native(filepath: Path) -> str:
     """
-    Extracts text, headers, and tables from a .docx file without third-party tools
-    by opening the zip structure and parsing word/document.xml directly.
-
-    Args:
-        filepath (Path): Path to DOCX file.
-
-    Returns:
-        str: Extracted structured Markdown text.
+    Safely extracts text, headers, and tables from a .docx file without third-party tools.
+    Guarded against corrupted zip headers or missing document.xml entries.
     """
     try:
         with zipfile.ZipFile(filepath, 'r') as docx_zip:
@@ -312,39 +274,30 @@ def parse_docx_native(filepath: Path) -> str:
                 elif tag == 'tbl':
                     table_rows = []
                     for row in child.findall('.//w:tr', ns):
-                        row_cells = ["".join(node.text for node in cell.findall('.//w:t', ns) if node.text).strip().replace("
-", " ") for cell in row.findall('.//w:tc', ns)]
+                        row_cells = ["".join(node.text for node in cell.findall('.//w:t', ns) if node.text).strip().replace("\n", " ") for cell in row.findall('.//w:tc', ns)]
                         if any(row_cells):
                             table_rows.append("| " + " | ".join(row_cells) + " |")
                     if table_rows:
-                        blocks.append("
-".join(table_rows))
+                        blocks.append("\n".join(table_rows))
 
-        raw_text = "
-
-".join(blocks)
+        raw_text = "\n\n".join(blocks)
         return clean_extracted_text(raw_text)
-    except Exception:
+    except Exception as err:
+        print(f"  [Non-Blocking Warning] Skipping corrupted DOCX file {filepath.name}: {err}", file=sys.stderr)
         return ""
 
 
 def parse_pdf_native(filepath: Path) -> str:
     """
-    Extracts text from a PDF file using system CLI tools (pdftotext) or a pure 
-    Python fallback regex string extraction.
-
-    Args:
-        filepath (Path): Path to PDF document.
-
-    Returns:
-        str: Extracted clean Markdown text.
+    Extracts text from PDF files using system CLI pdftotext or internal binary regex pass.
+    Fault-tolerant against bad stream structures or missing binary system dependencies.
     """
     raw_text = ""
     try:
         cmd = ["pdftotext", "-layout", str(filepath), "-"]
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
         raw_text = result.stdout
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except Exception:
         pass
 
     if not raw_text.strip():
@@ -364,9 +317,9 @@ def parse_pdf_native(filepath: Path) -> str:
                             strings.append(decoded)
                     except Exception:
                         pass
-            raw_text = "
-".join(strings)
-        except Exception:
+            raw_text = "\n".join(strings)
+        except Exception as err:
+            print(f"  [Non-Blocking Warning] Skipping unparseable PDF file {filepath.name}: {err}", file=sys.stderr)
             return ""
 
     return clean_extracted_text(raw_text)
@@ -375,12 +328,7 @@ def parse_pdf_native(filepath: Path) -> str:
 def parse_url_native(url: str) -> str:
     """
     Fetches remote web content via urllib and parses HTML DOM into structured text.
-
-    Args:
-        url (str): Remote HTTP/HTTPS URL.
-
-    Returns:
-        str: Cleaned text with Markdown structure.
+    Fault-tolerant against HTTP 40x/50x errors, SSL issues, and network timeouts.
     """
     req = urllib.request.Request(
         url,
@@ -398,26 +346,15 @@ def parse_url_native(url: str) -> str:
         parser.feed(html_content)
         raw_text = parser.get_text()
 
-        header_attr = f"<!-- Source: {url} -->
-
-"
+        header_attr = f"<!-- Source: {url} -->\n\n"
         return header_attr + clean_extracted_text(raw_text)
-    except Exception as e:
-        print(f"  [Error] Failed to fetch or parse URL {url}: {e}", file=sys.stderr)
+    except Exception as err:
+        print(f"  [Non-Blocking Warning] Could not fetch URL {url}: {err}", file=sys.stderr)
         return ""
 
 
 def minified_text_lossless(content: str) -> str:
-    """
-    Applies lossless text minification to string content.
-    Removes trailing spaces and collapses consecutive empty lines.
-
-    Args:
-        content (str): Raw string content.
-
-    Returns:
-        str: Minified string content.
-    """
+    """Removes trailing spaces and collapses consecutive empty lines."""
     lines = content.splitlines()
     cleaned = []
     prev_empty = False
@@ -432,48 +369,28 @@ def minified_text_lossless(content: str) -> str:
         cleaned.append(stripped)
         prev_empty = is_empty
 
-    return "
-".join(cleaned)
+    return "\n".join(cleaned)
 
 
 def is_git_url(source: str) -> bool:
-    """Evaluates whether a target input string represents a remote Git URL."""
     return source.startswith("http://") or source.startswith("https://") or source.startswith("git@") or source.endswith(".git")
 
 
 def is_web_url(target: str) -> bool:
-    """Evaluates whether a target input string represents a Web URL (excluding .git endpoints)."""
     return (target.startswith("http://") or target.startswith("https://")) and not target.endswith(".git")
 
 
 def clone_git_repo(repo_url: str, target_dir: Path) -> bool:
-    """
-    Executes a shallow clone (`--depth 1`) of a remote Git repository.
-
-    Args:
-        repo_url (str): Remote Git URL to fetch.
-        target_dir (Path): Local destination directory path.
-
-    Returns:
-        bool: True if clone succeeded, False otherwise.
-    """
     try:
-        print(f"
-[1/3 Git Fetch] Streaming shallow clone from: {repo_url}")
+        print(f"\n[1/3 Git Fetch] Streaming shallow clone from: {repo_url}")
         print("----------------------------------------------------------------------")
         cmd = ["git", "clone", "--depth", "1", "--progress", repo_url, str(target_dir)]
         subprocess.run(cmd, check=True)
         print("----------------------------------------------------------------------")
-        print("[Git Fetch] Repository clone completed successfully.
-")
+        print("[Git Fetch] Repository clone completed successfully.\n")
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"
-[Error] Git clone failed for {repo_url}: {e}", file=sys.stderr)
-        return False
-    except FileNotFoundError:
-        print("
-[Error] 'git' binary not found on system PATH. Install git to fetch remote repos.", file=sys.stderr)
+    except Exception as e:
+        print(f"\n[Non-Blocking Error] Git clone failed for {repo_url}: {e}", file=sys.stderr)
         return False
 
 
@@ -482,19 +399,6 @@ def clone_git_repo(repo_url: str, target_dir: Path) -> bool:
 # ==============================================================================
 
 def process_source(source_identifier: str, base_dir: Path, source_name: str, minify: bool) -> Generator[Dict[str, Any], None, None]:
-    """
-    Reads files from a directory source and yields structured JSON documents.
-    Renders rolling line progress directly to stdout every 100 files.
-
-    Args:
-        source_identifier (str): Original input source identifier (local path or URL).
-        base_dir (Path): Resolved directory containing source files.
-        source_name (str): Identifier name for composite keys.
-        minify (bool): Whether to apply lossless text minification.
-
-    Yields:
-        Dict[str, Any]: Document record object.
-    """
     base_dir = base_dir.resolve()
     file_counter = 0
 
@@ -512,19 +416,19 @@ def process_source(source_identifier: str, base_dir: Path, source_name: str, min
 
             content = ""
 
-            # Automated binary document detection & conversion
-            if ext in [".docx", ".doc"]:
-                content = parse_docx_native(file_path)
-            elif ext == ".pdf":
-                content = parse_pdf_native(file_path)
-            else:
-                try:
+            try:
+                if ext in [".docx", ".doc"]:
+                    content = parse_docx_native(file_path)
+                elif ext == ".pdf":
+                    content = parse_pdf_native(file_path)
+                else:
                     raw = file_path.read_text(encoding="utf-8", errors="replace")
                     if not raw.strip():
                         continue
                     content = minified_text_lossless(raw) if minify else raw
-                except Exception:
-                    continue
+            except Exception as err:
+                print(f"  [Non-Blocking Error] Failed to read {file_path.name}: {err}", file=sys.stderr)
+                continue
 
             if not content.strip():
                 continue
@@ -533,8 +437,7 @@ def process_source(source_identifier: str, base_dir: Path, source_name: str, min
             file_counter += 1
 
             if file_counter % 100 == 0:
-                sys.stdout.write(f"
- --> Processed {file_counter:,} files... Current: {relative_path[:40]:<40}")
+                sys.stdout.write(f"\r --> Processed {file_counter:,} files... Current: {relative_path[:40]:<40}")
                 sys.stdout.flush()
 
             yield {
@@ -551,9 +454,7 @@ def process_source(source_identifier: str, base_dir: Path, source_name: str, min
                 },
             }
 
-    sys.stdout.write(f"
- --> Finished processing {file_counter:,} files in '{source_name}'!               
-")
+    sys.stdout.write(f"\r --> Finished processing {file_counter:,} files in '{source_name}'!               \n")
     sys.stdout.flush()
 
 
@@ -562,18 +463,6 @@ def process_source(source_identifier: str, base_dir: Path, source_name: str, min
 # ==============================================================================
 
 def split_dataset_file(input_file: Path, max_mb: float, compress: bool) -> List[Path]:
-    """
-    Reads an output dataset file and partitions it into numbered chunk files, 
-    ensuring no output chunk exceeds `max_mb` in size.
-
-    Args:
-        input_file (Path): Path to the source dataset file to split.
-        max_mb (float): Maximum allowed file size per output chunk in MiB.
-        compress (bool): If True, compresses output split chunks using Gzip (.gz).
-
-    Returns:
-        List[Path]: A list of resolved Path objects pointing to generated chunks.
-    """
     max_bytes = int(max_mb * 1024 * 1024)
     base_name = input_file.name
 
@@ -597,25 +486,26 @@ def split_dataset_file(input_file: Path, max_mb: float, compress: bool) -> List[
     current_file = open_out(current_path, "wt", encoding="utf-8")
     chunks.append(current_path)
 
-    print(f"
---> Auto-Splitting output dataset into {max_mb} MiB chunks...")
+    print(f"\n--> Auto-Splitting output dataset into {max_mb} MiB chunks...")
 
-    with open_in(input_file, "rt", encoding="utf-8") as f_in:
-        for line in f_in:
-            line_bytes = len(line.encode("utf-8"))
+    try:
+        with open_in(input_file, "rt", encoding="utf-8") as f_in:
+            for line in f_in:
+                line_bytes = len(line.encode("utf-8"))
 
-            if current_bytes + line_bytes > max_bytes and current_bytes > 0:
-                current_file.close()
-                chunk_idx += 1
-                current_bytes = 0
-                current_path = output_dir / f"{base_name}_part{chunk_idx:03d}{out_ext}"
-                current_file = open_out(current_path, "wt", encoding="utf-8")
-                chunks.append(current_path)
+                if current_bytes + line_bytes > max_bytes and current_bytes > 0:
+                    current_file.close()
+                    chunk_idx += 1
+                    current_bytes = 0
+                    current_path = output_dir / f"{base_name}_part{chunk_idx:03d}{out_ext}"
+                    current_file = open_out(current_path, "wt", encoding="utf-8")
+                    chunks.append(current_path)
 
-            current_file.write(line)
-            current_bytes += line_bytes
+                current_file.write(line)
+                current_bytes += line_bytes
+    finally:
+        current_file.close()
 
-    current_file.close()
     print(f"  • Created {len(chunks)} split chunks in destination directory: {output_dir}")
     return chunks
 
@@ -625,19 +515,6 @@ def split_dataset_file(input_file: Path, max_mb: float, compress: bool) -> List[
 # ==============================================================================
 
 def load_dataset_into_documents(file_path: Path) -> List[Document]:
-    """
-    Reads an ingested dataset file back into memory as standard LangChain 
-    `Document` objects, displaying live progress feedback during parsing.
-
-    Args:
-        file_path (Path): Path to dataset file (.jsonl or .jsonl.gz).
-
-    Returns:
-        List[Document]: List of parsed Document objects.
-
-    Raises:
-        FileNotFoundError: If target file does not exist.
-    """
     file_path = file_path.resolve()
 
     if not file_path.exists():
@@ -663,17 +540,13 @@ def load_dataset_into_documents(file_path: Path) -> List[Document]:
                 documents.append(doc)
 
                 if line_num % 1000 == 0:
-                    sys.stdout.write(f"
- --> Loaded {line_num:,} records into memory...")
+                    sys.stdout.write(f"\r --> Loaded {line_num:,} records into memory...")
                     sys.stdout.flush()
-            except json.JSONDecodeError:
+            except Exception:
                 pass
 
     elapsed = time.time() - start_time
-    sys.stdout.write(f"
- --> Loaded {len(documents):,} Document objects into memory in {elapsed:.2f}s!               
-
-")
+    sys.stdout.write(f"\r --> Loaded {len(documents):,} Document objects into memory in {elapsed:.2f}s!\n\n")
     sys.stdout.flush()
 
     return documents
@@ -684,20 +557,6 @@ def load_dataset_into_documents(file_path: Path) -> List[Document]:
 # ==============================================================================
 
 def run_ingestion(sources: List[str], output_path: Path, compress: bool, minify: bool, split_mb: Optional[float]) -> int:
-    """
-    Main ingestion pass controller. Orchestrates source fetching, parsing, 
-    minification, output serialization, and optional chunk splitting.
-
-    Args:
-        sources (List[str]): Input paths, Git URLs, or Web URLs.
-        output_path (Path): Target file destination path.
-        compress (bool): Enable Gzip compression (.jsonl.gz).
-        minify (bool): Enable lossless minification.
-        split_mb (Optional[float]): Byte-size threshold for automatic file splitting.
-
-    Returns:
-        int: Total number of ingested files written to disk.
-    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix="archon_ingest_"))
     total_files = 0
@@ -705,8 +564,7 @@ def run_ingestion(sources: List[str], output_path: Path, compress: bool, minify:
     open_fn = gzip.open if compress else open
 
     try:
-        print("
-======================================================================")
+        print("\n======================================================================")
         print("          STARTING UNIFIED CODEBASE & DOCUMENT INGESTION             ")
         print("======================================================================")
 
@@ -716,48 +574,48 @@ def run_ingestion(sources: List[str], output_path: Path, compress: bool, minify:
                 if not source:
                     continue
 
-                if is_web_url(source):
-                    print(f"
-[Web Fetch] Parsing URL: {source}")
-                    content = parse_url_native(source)
-                    if content.strip():
-                        parsed_url = urllib.parse.urlparse(source)
-                        slug = re.sub(r'[^a-zA-Z0-9]', '_', parsed_url.netloc + parsed_url.path).strip('_')
-                        doc = {
-                            "id": f"web/{slug[:50]}",
-                            "text": content,
-                            "metadata": {
-                                "source": source,
-                                "source_name": parsed_url.netloc,
-                                "file_path": source,
-                                "file_name": slug[:30],
-                                "file_extension": ".html",
-                                "file_size_bytes": len(content.encode("utf-8")),
-                                "line_count": len(content.splitlines()),
+                try:
+                    if is_web_url(source):
+                        print(f"\n[Web Fetch] Parsing URL: {source}")
+                        content = parse_url_native(source)
+                        if content.strip():
+                            parsed_url = urllib.parse.urlparse(source)
+                            slug = re.sub(r'[^a-zA-Z0-9]', '_', parsed_url.netloc + parsed_url.path).strip('_')
+                            doc = {
+                                "id": f"web/{slug[:50]}",
+                                "text": content,
+                                "metadata": {
+                                    "source": source,
+                                    "source_name": parsed_url.netloc,
+                                    "file_path": source,
+                                    "file_name": slug[:30],
+                                    "file_extension": ".html",
+                                    "file_size_bytes": len(content.encode("utf-8")),
+                                    "line_count": len(content.splitlines()),
+                                }
                             }
-                        }
-                        f_out.write(json.dumps(doc, ensure_ascii=False) + "
-")
-                        total_files += 1
-
-                elif is_git_url(source):
-                    repo_name = source.rstrip("/").split("/")[-1].replace(".git", "")
-                    clone_path = temp_dir / f"repo_{idx}_{repo_name}"
-                    if clone_git_repo(source, clone_path):
-                        for doc in process_source(source, clone_path, repo_name, minify):
-                            f_out.write(json.dumps(doc, ensure_ascii=False) + "
-")
+                            f_out.write(json.dumps(doc, ensure_ascii=False) + "\n")
                             total_files += 1
 
-                else:
-                    local_path = Path(source)
-                    if local_path.exists() and local_path.is_dir():
-                        for doc in process_source(str(local_path.resolve()), local_path, local_path.name, minify):
-                            f_out.write(json.dumps(doc, ensure_ascii=False) + "
-")
-                            total_files += 1
+                    elif is_git_url(source):
+                        repo_name = source.rstrip("/").split("/")[-1].replace(".git", "")
+                        clone_path = temp_dir / f"repo_{idx}_{repo_name}"
+                        if clone_git_repo(source, clone_path):
+                            for doc in process_source(source, clone_path, repo_name, minify):
+                                f_out.write(json.dumps(doc, ensure_ascii=False) + "\n")
+                                total_files += 1
+
                     else:
-                        print(f"  [Warning] Local path '{source}' not found. Skipping.", file=sys.stderr)
+                        local_path = Path(source)
+                        if local_path.exists() and local_path.is_dir():
+                            for doc in process_source(str(local_path.resolve()), local_path, local_path.name, minify):
+                                f_out.write(json.dumps(doc, ensure_ascii=False) + "\n")
+                                total_files += 1
+                        else:
+                            print(f"  [Warning] Local path '{source}' not found. Skipping.", file=sys.stderr)
+                except Exception as err:
+                    print(f"  [Non-Blocking Warning] Error processing source '{source}': {err}", file=sys.stderr)
+                    continue
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -765,16 +623,13 @@ def run_ingestion(sources: List[str], output_path: Path, compress: bool, minify:
     rate = total_files / elapsed if elapsed > 0 else 0
     compression_label = "Gzip Compressed (.gz)" if compress else "Uncompressed Plain Text"
 
-    print("
-----------------------------------------------------------------------")
+    print("\n----------------------------------------------------------------------")
     print(f" Ingestion Summary:")
     print(f"  • Total Sources Processed: {total_files:,}")
     print(f"  • Elapsed Time:          {elapsed:.2f} seconds ({rate:.1f} files/sec)")
     print(f"  • Saved Destination:     {output_path} [{compression_label}]")
-    print("----------------------------------------------------------------------
-")
+    print("----------------------------------------------------------------------\n")
 
-    # Trigger Auto-Splitting if --split-mb is specified
     if split_mb and split_mb > 0 and output_path.exists():
         split_dataset_file(output_path, split_mb, compress)
 
@@ -782,9 +637,6 @@ def run_ingestion(sources: List[str], output_path: Path, compress: bool, minify:
 
 
 def main() -> None:
-    """
-    Configures command-line argument parsing and coordinates pipeline execution.
-    """
     parser = argparse.ArgumentParser(
         description="ARCHON Unified Ingestion & Auto-Splitting Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -796,7 +648,7 @@ Examples:
         """
     )
 
-    parser.add_argument("sources", nargs="*", help="Local directory paths, Git URLs, or Web URLs to ingest.")
+    parser.add_argument("sources", nargs="*", default=["."], help="Local directory paths, Git URLs, or Web URLs to ingest (Default: current directory '.').")
     parser.add_argument("-o", "--output", type=str, default="codebase_ingested.jsonl", help="Destination file path.")
     parser.add_argument("-c", "--compress", action="store_true", help="Enable Gzip compression (.jsonl.gz).")
     parser.add_argument("--no-minify", action="store_true", help="Disable lossless text minification.")
@@ -817,11 +669,6 @@ Examples:
             sys.exit(1)
         return
 
-    if not args.sources:
-        print("Error: No input sources specified. Provide local paths, Git URLs, or Web URLs.", file=sys.stderr)
-        parser.print_help()
-        sys.exit(1)
-
     processed_count = run_ingestion(
         sources=args.sources,
         output_path=out_path,
@@ -840,13 +687,9 @@ Examples:
             print("--------------------------------------")
 
 
-# ==============================================================================
-# SCRIPT FOOTER & EXECUTION GUARD
-# ==============================================================================
-
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("[System] Ingestion cancelled by user (KeyboardInterrupt). Exiting cleanly.", file=sys.stderr)
+        print("\n\n[System] Ingestion cancelled by user (KeyboardInterrupt). Exiting cleanly.", file=sys.stderr)
         sys.exit(130)
