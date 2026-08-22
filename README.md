@@ -1,4 +1,4 @@
-# ARCHON Dataset Ingestion & Processing Pipeline
+#Dataset Ingestion & Processing Pipeline
 
 A suite of zero-dependency, high-performance Python utilities designed to convert raw documents, web content, and local/remote codebases into clean, compressed, minified line-delimited datasets (`.jsonl.gz`), and safely partition oversized files into target byte-size chunks without breaking line or structural record boundaries[cite: 1, 2, 4].
 
