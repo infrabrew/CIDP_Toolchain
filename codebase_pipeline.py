@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # ==============================================================================
 # AUTHOR:          Peter A. Aldrich Jr. (PJ)
-# PROJECT:         ARCHON AI Platform Engineering
+# PROJECT:         AI Platform Engineering
 # MODULE:          codebase_pipeline.py
 # DESCRIPTION:     Unified Codebase & Document Ingestion Engine with Integrated 
 #                  PDF/DOCX Document Parsing, Web Crawling, and Auto-Chunk Splitting.
